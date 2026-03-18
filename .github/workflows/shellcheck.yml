@@ -1,0 +1,24 @@
+# .github/workflows/shellcheck.yml
+name: ShellCheck Lint
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  lint:
+    name: POSIX Shell Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run ShellCheck
+        run: |
+          shellcheck \
+            --shell=sh \
+            --exclude=SC1008,SC1091 \
+            matrix_bot matrix_send matrixbot
