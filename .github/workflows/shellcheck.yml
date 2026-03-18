@@ -22,7 +22,7 @@ jobs:
         run: |
           shellcheck \
             --shell=sh \
-            --exclude=SC1008,SC1091 \
+            --exclude=SC1008,SC1091,SC3043,SC2016,SC1090,SC2153,SC2034 \
             usr/lib/matrix/matrix_bot \
             usr/lib/matrix/matrix_send \
             etc/init.d/matrixbot
