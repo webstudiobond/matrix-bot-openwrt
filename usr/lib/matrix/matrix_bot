@@ -608,6 +608,7 @@ process_command() {
     fi
 
     set -f
+    # shellcheck disable=SC2086
     set -- $BODY
     set +f
     CMD="$1"
