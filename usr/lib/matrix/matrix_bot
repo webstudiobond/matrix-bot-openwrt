@@ -144,8 +144,7 @@ background_exec() {
         MAX_ATTEMPTS=30
         while [ $i -lt $MAX_ATTEMPTS ]; do
             sleep 2
-            "$SENDER_SCRIPT" --room-id "$room_id" "$MSG" >/dev/null 2>&1
-            if [ $? -eq 0 ]; then break; fi
+            "$SENDER_SCRIPT" --room-id "$room_id" "$MSG" >/dev/null 2>&1 && break
             i=$((i + 1))
         done
 
@@ -384,6 +383,7 @@ get_wifi_clients() {
         printf '%s\n' "$ASSOC_LIST" | while read -r line; do
             case "$line" in *dBm*) ;; *) continue ;; esac
 
+            # shellcheck disable=SC2086
             set -- $line
             MAC="$1"
             SIGNAL="$2 $3"
@@ -825,6 +825,7 @@ ${WOL_PC_INFO}"
                 if command -v etherwake >/dev/null; then
                     IFACE=$(uci -q get network.lan.device); [ -z "$IFACE" ] && IFACE="br-lan"
                     OUT=$(etherwake -i "$IFACE" "$SAFE_ARGS" 2>&1)
+                    # shellcheck disable=SC2181
                     if [ $? -eq 0 ]; then
                         RES="🤖 Magic packet sent to <code>$SAFE_ARGS</code>"
                     else
@@ -845,6 +846,7 @@ ${WOL_PC_INFO}"
                 elif command -v etherwake >/dev/null; then
                     IFACE=$(uci -q get network.lan.device); [ -z "$IFACE" ] && IFACE="br-lan"
                     OUT=$(etherwake -i "$IFACE" "$MAC_PC" 2>&1)
+                    # shellcheck disable=SC2181
                     if [ $? -eq 0 ]; then
                         RES="🤖 Waking PC (<code>$MAC_PC</code>)..."
                     else
@@ -885,7 +887,7 @@ listen_e2ee() {
             -o BatchMode=yes \
             -tt "$SSH_USER@$SSH_HOST" "$MC_CMD" < /dev/null 2>&1 | \
         while IFS= read -r line; do
-            line="${line%$CR}"
+            line="${line%"$CR"}"
 
             case "$line" in
                 \{*)
