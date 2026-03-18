@@ -11,6 +11,8 @@ jobs:
   lint:
     name: POSIX Shell Analysis
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: Checkout repository
@@ -21,4 +23,6 @@ jobs:
           shellcheck \
             --shell=sh \
             --exclude=SC1008,SC1091 \
-            matrix_bot matrix_send matrixbot
+            usr/lib/matrix/matrix_bot \
+            usr/lib/matrix/matrix_send \
+            etc/init.d/matrixbot
