@@ -166,9 +166,9 @@ mkdir -p /usr/lib/matrix
 ### 2. Download scripts
 
 ```sh
-curl -sSL "https://raw.githubusercontent.com/webstudiobond/matrix-bot-openwrt/refs/heads/main/usr/lib/matrix/matrix_bot" -o /usr/lib/matrix/matrix_bot
-curl -sSL "https://raw.githubusercontent.com/webstudiobond/matrix-bot-openwrt/refs/heads/main/usr/lib/matrix/matrix_send" -o /usr/lib/matrix/matrix_send
-curl -sSL "https://raw.githubusercontent.com/webstudiobond/matrix-bot-openwrt/refs/heads/main/etc/init.d/matrixbot" -o /etc/init.d/matrixbot
+curl -sSL "https://raw.githubusercontent.com/webstudiobond/matrix-bot-openwrt/refs/heads/v1.0.0/usr/lib/matrix/matrix_bot" -o /usr/lib/matrix/matrix_bot
+curl -sSL "https://raw.githubusercontent.com/webstudiobond/matrix-bot-openwrt/refs/heads/v1.0.0/usr/lib/matrix/matrix_send" -o /usr/lib/matrix/matrix_send
+curl -sSL "https://raw.githubusercontent.com/webstudiobond/matrix-bot-openwrt/refs/heads/v1.0.0/etc/init.d/matrixbot" -o /etc/init.d/matrixbot
 ```
 
 ### 3. Set permissions
