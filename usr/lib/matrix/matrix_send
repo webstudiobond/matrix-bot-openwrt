@@ -77,11 +77,11 @@ ENCODED_ROOM=$(printf '%s' "$TARGET_ROOM" | sed 's/#/%23/g; s/!/%21/g')
 PLAIN_TEXT=$(printf '%s' "$MSG" | sed 's/<[bB][rR][^>]*>/\n/g; s/<[^>]*>//g')
 
 if [ "$DEBUG_MODE" -eq 1 ]; then
-    printf '--- PREPARED DATA ---\n'
+    printf '%s\n' "--- PREPARED DATA ---"
     printf 'Notification Body (Plain):\n%s\n' "$PLAIN_TEXT"
-    printf '-----------------------\n'
+    printf '%s\n' "-----------------------"
     printf 'Room Message (HTML):\n%s\n' "$MSG"
-    printf '-----------------------\n'
+    printf '%s\n' "-----------------------"
 fi
 
 # === 2. JSON FORMATION ===
@@ -90,9 +90,11 @@ if [ "$FORCE_FALLBACK" -eq 0 ] && command -v jq >/dev/null 2>&1; then
     JSON_PAYLOAD=$(jq -n --arg b "$PLAIN_TEXT" --arg f "$MSG" \
         '{msgtype: "m.text", body: $b, format: "org.matrix.custom.html", formatted_body: $f}')
 else
-    [ "$FORCE_FALLBACK" -eq 1 ] \
-        && debug_echo "JSON Strategy: Native (awk fallback) [FORCED]" \
-        || debug_echo "JSON Strategy: Native (awk fallback)"
+    if [ "$FORCE_FALLBACK" -eq 1 ]; then
+        debug_echo "JSON Strategy: Native (awk fallback) [FORCED]"
+    else
+        debug_echo "JSON Strategy: Native (awk fallback)"
+    fi
 
     AWK_ESC='{ gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); if (NR > 1) printf "\\n"; printf "%s", $0 }'
     ESC_PLAIN=$(printf '%s' "$PLAIN_TEXT" | awk "$AWK_ESC")
@@ -131,6 +133,7 @@ try_ssh() {
         -T \
         "$SSH_USER@$SSH_HOST" matrix-commander-rs --room "'$TARGET_ROOM'" --html --message - >/dev/null 2>&1
 
+    # shellcheck disable=SC2181
     if [ $? -eq 0 ]; then
         debug_echo "Transport: SSH (Success)"
         return 0
@@ -174,7 +177,11 @@ if [ "$FORCE_WGET" -eq 0 ] && command -v curl > /dev/null 2>&1; then
         --max-time 30 > /dev/null
     exit $?
 elif command -v wget > /dev/null 2>&1; then
-    [ "$FORCE_WGET" -eq 1 ] && debug_echo "Transport: WGET [FORCED]" || debug_echo "Transport: WGET"
+    if [ "$FORCE_WGET" -eq 1 ]; then
+        debug_echo "Transport: WGET [FORCED]"
+    else
+        debug_echo "Transport: WGET"
+    fi
     # wget does not support reading headers from a file; inline the token here.
     # This is a fallback path — curl is strongly preferred for token hygiene.
     wget -q -O /dev/null \
