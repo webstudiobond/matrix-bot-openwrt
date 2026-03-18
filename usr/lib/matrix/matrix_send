@@ -1,0 +1,190 @@
+#!/bin/sh
+
+export LC_ALL=C
+
+CONF_FILE="/etc/config/bot.conf"
+
+if [ -f "$CONF_FILE" ]; then
+    . "$CONF_FILE" || { printf '[Error] Failed to source config\n' >&2; exit 1; }
+    if [ -z "$MATRIX_URL" ] || [ -z "$MATRIX_ACCESS_TOKEN" ]; then
+        printf '[Error] MATRIX_URL or MATRIX_ACCESS_TOKEN missing in config\n' >&2
+        exit 1
+    fi
+else
+    printf "[Error] Config file not found: %s\n" "$CONF_FILE" >&2
+    exit 1
+fi
+
+# === ARGUMENTS ===
+DEBUG_MODE=0
+MODE="auto"
+RAW_TARGET_ROOM=""
+FORCE_WGET=0
+FORCE_FALLBACK=0
+
+while true; do
+    case "$1" in
+        -d|--debug) DEBUG_MODE=1; shift ;;
+        --ssh-only) MODE="ssh"; shift ;;
+        --http-only) MODE="http"; shift ;;
+        --no-e2ee) MODE="http"; shift ;;
+        --force-wget) FORCE_WGET=1; shift ;;
+        --force-fallback) FORCE_FALLBACK=1; shift ;;
+        --room-id)
+            if [ -n "$2" ] && [ "${2#-}" = "$2" ]; then
+                RAW_TARGET_ROOM="$2"
+                shift 2
+            else
+                printf '[Error] --room-id requires an argument\n' >&2
+                exit 1
+            fi
+            ;;
+        -*) printf "Unknown option: %s\n" "$1" >&2; exit 1 ;;
+        *) break ;;
+    esac
+done
+
+MSG="$*"
+
+if [ -z "$MSG" ]; then
+    printf '[Error] No message provided\n' >&2
+    exit 1
+fi
+
+debug_echo() { [ "$DEBUG_MODE" -eq 1 ] && printf "[Debug] %s\n" "$1"; }
+
+if [ -z "$RAW_TARGET_ROOM" ]; then
+    RAW_TARGET_ROOM="$MATRIX_ROOM_E2EE_ID"
+    if [ -z "$RAW_TARGET_ROOM" ]; then
+        printf '[Error] No room ID specified and MATRIX_ROOM_E2EE_ID not set in config\n' >&2
+        exit 1
+    fi
+fi
+
+# Sanitize: allow only characters valid in a Matrix room ID.
+TARGET_ROOM=$(printf '%s' "$RAW_TARGET_ROOM" | tr -cd 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.:_!#=-')
+
+if [ -z "$TARGET_ROOM" ]; then
+    printf '[Error] Invalid or empty room ID after sanitization\n' >&2
+    exit 1
+fi
+
+# Percent-encode characters that are valid in a room ID but unsafe in a URL path segment.
+# '#' (alias rooms) would be treated as a URL fragment and truncate the path.
+ENCODED_ROOM=$(printf '%s' "$TARGET_ROOM" | sed 's/#/%23/g; s/!/%21/g')
+
+# === 1. TEXT PREPARATION ===
+PLAIN_TEXT=$(printf '%s' "$MSG" | sed 's/<[bB][rR][^>]*>/\n/g; s/<[^>]*>//g')
+
+if [ "$DEBUG_MODE" -eq 1 ]; then
+    printf '--- PREPARED DATA ---\n'
+    printf 'Notification Body (Plain):\n%s\n' "$PLAIN_TEXT"
+    printf '-----------------------\n'
+    printf 'Room Message (HTML):\n%s\n' "$MSG"
+    printf '-----------------------\n'
+fi
+
+# === 2. JSON FORMATION ===
+if [ "$FORCE_FALLBACK" -eq 0 ] && command -v jq >/dev/null 2>&1; then
+    debug_echo "JSON Strategy: JQ (Best Practice)"
+    JSON_PAYLOAD=$(jq -n --arg b "$PLAIN_TEXT" --arg f "$MSG" \
+        '{msgtype: "m.text", body: $b, format: "org.matrix.custom.html", formatted_body: $f}')
+else
+    [ "$FORCE_FALLBACK" -eq 1 ] \
+        && debug_echo "JSON Strategy: Native (awk fallback) [FORCED]" \
+        || debug_echo "JSON Strategy: Native (awk fallback)"
+
+    AWK_ESC='{ gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); if (NR > 1) printf "\\n"; printf "%s", $0 }'
+    ESC_PLAIN=$(printf '%s' "$PLAIN_TEXT" | awk "$AWK_ESC")
+    ESC_HTML=$(printf '%s' "$MSG" | awk "$AWK_ESC")
+    JSON_PAYLOAD="{\"msgtype\":\"m.text\",\"body\":\"$ESC_PLAIN\",\"format\":\"org.matrix.custom.html\",\"formatted_body\":\"$ESC_HTML\"}"
+fi
+
+# === 3. SENDING VIA SSH ===
+try_ssh() {
+    if [ -z "$SSH_HOST" ] || [ -z "$SSH_KEY" ]; then
+        debug_echo "SSH not configured (missing SSH_HOST or SSH_KEY)"
+        return 1
+    fi
+
+    if [ -z "$SSH_USER" ] || [ -z "$SSH_PORT" ]; then
+        debug_echo "SSH config incomplete (missing SSH_USER or SSH_PORT)"
+        return 1
+    fi
+
+    if [ ! -r "$SSH_KEY" ]; then
+        debug_echo "SSH key not found or not readable: $SSH_KEY"
+        [ "$MODE" = "ssh" ] && printf '[Error] SSH key not accessible: %s\n' "$SSH_KEY" >&2
+        return 1
+    fi
+
+    debug_echo "Attempting SSH -> Room: $TARGET_ROOM"
+
+    printf "%s" "$MSG" | ssh -i "$SSH_KEY" -p "$SSH_PORT" \
+        -o StrictHostKeyChecking=yes \
+        -o UserKnownHostsFile=/etc/matrix_bot_known_hosts \
+        -o LogLevel=ERROR \
+        -o BatchMode=yes \
+        -o ConnectTimeout=10 \
+        -o ServerAliveInterval=5 \
+        -o ServerAliveCountMax=2 \
+        -T \
+        "$SSH_USER@$SSH_HOST" matrix-commander-rs --room "'$TARGET_ROOM'" --html --message - >/dev/null 2>&1
+
+    if [ $? -eq 0 ]; then
+        debug_echo "Transport: SSH (Success)"
+        return 0
+    fi
+    return 1
+}
+
+if [ "$MODE" != "http" ]; then
+    if try_ssh; then
+        exit 0
+    fi
+    if [ "$MODE" = "ssh" ]; then
+        printf '[Error] SSH transport failed and --ssh-only was specified\n' >&2
+        exit 1
+    fi
+    debug_echo "SSH failed or skipped, fallback to HTTP..."
+fi
+
+# === 4. SENDING VIA HTTP ===
+debug_echo "HTTP -> Room: $TARGET_ROOM"
+
+MATRIX_URL=${MATRIX_URL%/}
+
+FULL_URL="$MATRIX_URL/_matrix/client/v3/rooms/$ENCODED_ROOM/send/m.room.message"
+
+# Write the Bearer token to a private temp file to avoid exposure in ps output.
+# curl -K reads config directives (including headers) from a file.
+HDR_FILE="/tmp/mhdr_$$.tmp"
+trap 'rm -f "$HDR_FILE"' EXIT INT TERM
+
+( umask 177 && : > "$HDR_FILE" ) || { printf '[Error] Failed to create temp file in /tmp\n' >&2; exit 1; }
+printf 'header = "Authorization: Bearer %s"\n' "$MATRIX_ACCESS_TOKEN" > "$HDR_FILE"
+
+if [ "$FORCE_WGET" -eq 0 ] && command -v curl > /dev/null 2>&1; then
+    debug_echo "Transport: CURL"
+    curl -s -f -X POST "$FULL_URL" \
+        -K "$HDR_FILE" \
+        -H "Content-Type: application/json" \
+        -d "$JSON_PAYLOAD" \
+        --connect-timeout 10 \
+        --max-time 30 > /dev/null
+    exit $?
+elif command -v wget > /dev/null 2>&1; then
+    [ "$FORCE_WGET" -eq 1 ] && debug_echo "Transport: WGET [FORCED]" || debug_echo "Transport: WGET"
+    # wget does not support reading headers from a file; inline the token here.
+    # This is a fallback path — curl is strongly preferred for token hygiene.
+    wget -q -O /dev/null \
+        --header "Authorization: Bearer $MATRIX_ACCESS_TOKEN" \
+        --header "Content-Type: application/json" \
+        --post-data "$JSON_PAYLOAD" \
+        --timeout=30 \
+        "$FULL_URL"
+    exit $?
+fi
+
+printf '[Error] No HTTP client available (curl or wget required)\n' >&2
+exit 1
