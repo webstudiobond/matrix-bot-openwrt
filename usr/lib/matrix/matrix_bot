@@ -1,0 +1,1053 @@
+#!/bin/sh
+# ==============================================================================
+# Matrix Bot for OpenWrt
+# Description: Remote router management via Matrix protocol.
+# Features: E2EE support via matrix-commander-rs, HTTP fallback, service control.
+# Author: DevSec
+# License: MIT
+# ==============================================================================
+
+export LC_ALL=C
+
+# === CONFIGURATION ===
+CONF_FILE="/etc/config/bot.conf"
+SENDER_SCRIPT="/usr/lib/matrix/matrix_send"
+
+# === OPERATING MODES ===
+DEBUG_MODE=0
+RUN_MODE="auto"
+
+# Default allowed services (fallback if SVC_WANTED is missing in config)
+DEFAULT_SERVICES="dnsmasq firewall network odhcpd cron uhttpd"
+
+MAIN_PID=""
+
+# === CLEANUP ON EXIT ===
+cleanup() {
+    trap - INT TERM EXIT
+    printf '\nStopping Matrix Bot...\n'
+
+    # Remove temp files created during runtime
+    rm -f /tmp/sync_* /tmp/evt_* /tmp/ssh_evt_* \
+          /tmp/enc_check_* /tmp/mhdr_*
+
+    if [ -n "$MAIN_PID" ]; then
+        kill -TERM "$MAIN_PID" 2>/dev/null
+        sleep 1
+        kill -0 "$MAIN_PID" 2>/dev/null && kill -KILL "$MAIN_PID" 2>/dev/null
+    fi
+
+    for p in $(jobs -p); do
+        kill -TERM "$p" 2>/dev/null
+    done
+    sleep 1
+    for p in $(jobs -p); do
+        kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null
+    done
+
+    if [ -n "$SSH_PORT" ]; then
+        PIDS_SSH=$(ps | awk -v p="$SSH_PORT" '/ssh/ && $0 ~ p && !/awk/ {print $1}')
+        for pid in $PIDS_SSH; do [ "$pid" != "$$" ] && kill -TERM "$pid" 2>/dev/null; done
+        sleep 1
+        for pid in $PIDS_SSH; do [ "$pid" != "$$" ] && kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null; done
+    fi
+
+    PIDS_CURL=$(ps | awk '/curl/ && /_matrix/ && !/awk/ {print $1}')
+    for pid in $PIDS_CURL; do [ "$pid" != "$$" ] && kill -TERM "$pid" 2>/dev/null; done
+    sleep 1
+    for pid in $PIDS_CURL; do [ "$pid" != "$$" ] && kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null; done
+
+    exit 0
+}
+trap cleanup INT TERM EXIT
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -d) DEBUG_MODE=1; printf "DEBUG ON\n" ;;
+        --no-e2ee) RUN_MODE="http"; printf "MODE: HTTP ONLY\n" ;;
+        --e2ee) RUN_MODE="e2ee"; printf "MODE: SSH ONLY\n" ;;
+    esac
+    shift
+done
+
+debug_log() { [ "$DEBUG_MODE" -eq 1 ] && printf "[DEBUG] %s\n" "$1"; }
+
+if [ -f "$CONF_FILE" ]; then
+    . "$CONF_FILE" || { printf "Error: Failed to source config file\n" >&2; exit 1; }
+
+    if [ -z "$MATRIX_URL" ] || [ -z "$MATRIX_ACCESS_TOKEN" ] || [ -z "$MATRIX_BOT_USER" ]; then
+        printf "Error: Required Matrix configuration missing\n" >&2
+        exit 1
+    fi
+else
+    printf "Config not found\n" >&2
+    exit 1
+fi
+
+# === SANITIZATION ===
+
+sanitize_room_id() {
+    local raw="$1"
+    local clean
+    clean=$(printf '%s' "$raw" | tr -cd 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.:_!#=-')
+    [ "$raw" != "$clean" ] && debug_log "SECURITY: Room ID sanitized: '$raw' -> '$clean'"
+    printf '%s' "$clean"
+}
+
+sanitize_user_id() {
+    local raw="$1"
+    printf '%s' "$raw" | tr -cd 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.:_@-'
+}
+
+# Percent-encode characters that are valid in a Matrix room ID but unsafe in a URL path segment.
+# '#' (alias rooms) would be treated as a URL fragment; '!' has no special meaning but is encoded
+# for strict RFC 3986 compliance.
+urlencode_room() {
+    printf '%s' "$1" | sed 's/#/%23/g; s/!/%21/g'
+}
+
+# === SENDING ===
+
+reply() {
+    local MSG="$1"
+    local ROOM_ID="$2"
+
+    debug_log "Executing sender for $ROOM_ID"
+    if [ "$DEBUG_MODE" -eq 1 ]; then
+        "$SENDER_SCRIPT" -d --room-id "$ROOM_ID" "$MSG" </dev/null >> /tmp/matrix_send.log 2>&1 &
+    else
+        "$SENDER_SCRIPT" --room-id "$ROOM_ID" "$MSG" </dev/null &
+    fi
+}
+
+# === BACKGROUND EXECUTION ===
+# Executes a command in the background and retries notifying Matrix of the result.
+# Usage: background_exec <label> <room_id> <cmd> [args...]
+background_exec() {
+    local service_name="$1"
+    local room_id="$2"
+    shift 2
+
+    (
+        sleep 2
+        "$@"
+        ERR_CODE=$?
+
+        # Build the status message once; value cannot change between retry attempts.
+        if [ "$ERR_CODE" -eq 0 ]; then
+            MSG="✅ <b>$service_name</b>: complete."
+        else
+            MSG="❌ <b>$service_name</b>: FAILED (Code $ERR_CODE)."
+        fi
+
+        i=0
+        MAX_ATTEMPTS=30
+        while [ $i -lt $MAX_ATTEMPTS ]; do
+            sleep 2
+            "$SENDER_SCRIPT" --room-id "$room_id" "$MSG" >/dev/null 2>&1
+            if [ $? -eq 0 ]; then break; fi
+            i=$((i + 1))
+        done
+
+        if [ $i -eq $MAX_ATTEMPTS ]; then
+            logger -t matrix_bot "Failed to send notification after $MAX_ATTEMPTS attempts: $service_name"
+        fi
+    ) &
+}
+
+# === WIFI RADIO ACTION (DRY helper) ===
+# $1=action (up|down|reload), $2=radio UCI name (radio0|radio1),
+# $3=human label (2.4G|5G), $4=room_id
+wifi_radio_action() {
+    local action="$1" radio="$2" label="$3" room_id="$4"
+    if ! uci -q get "wireless.$radio" >/dev/null 2>&1; then
+        reply "❌ <b>Error:</b> $radio not found in config." "$room_id"
+        return
+    fi
+    reply "🤖⏳ WiFi $label ${action}ing..." "$room_id"
+    background_exec "WiFi $label" "$room_id" wifi "$action" "$radio"
+}
+
+# === WIFI INFO ===
+
+get_wifi_devices() {
+    iwinfo 2>/dev/null | awk '/ESSID/ {print $1}'
+}
+
+get_wifi_info() {
+    local OUT="🤖 <b>WiFi Status:</b>"
+
+    DEVICES=$(get_wifi_devices)
+
+    if [ -z "$DEVICES" ]; then
+        printf "🤖 No wireless interfaces found.\n"
+        return
+    fi
+
+    # Cache UCI wireless config once to prevent slow I/O inside the loop
+    UCI_WIRELESS=$(uci show wireless 2>/dev/null)
+
+    for iface in $DEVICES; do
+        INFO=$(iwinfo "$iface" info)
+
+        # --- SSID ---
+        SSID=$(printf '%s' "$INFO" | awk -F'"' '/ESSID:/ {print $2}')
+        if [ "$SSID" = "unknown" ] || [ -z "$SSID" ]; then SSID="[Hidden]"; fi
+
+        SSID=$(printf '%s' "$SSID" | tr -cd 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ._-')
+        if [ -z "$SSID" ]; then SSID="[Hidden]"; fi
+
+        if [ "$WIFI_DETAILED" != "1" ]; then
+            MODE=$(printf '%s' "$INFO" | awk -F'Mode: ' '/Mode:/ {split($2, a, " "); print a[1]}')
+            CHAN=$(printf '%s' "$INFO" | awk -F'Channel: ' '/Channel:/ {print $2}')
+            RATE=$(printf '%s' "$INFO" | awk -F'Bit Rate: ' '/Bit Rate:/ {print $2}')
+
+            KEY="-"
+            ENCRYPTION="-"
+            SECTION=$(printf '%s\n' "$UCI_WIRELESS" | awk -F. -v pat=".ssid='$SSID'" 'index($0, pat) {print $1"."$2; exit}')
+            if [ -n "$SECTION" ]; then
+                KEY=$(uci -q get "${SECTION}.key")
+                ENCRYPTION=$(uci -q get "${SECTION}.encryption")
+                [ -z "$ENCRYPTION" ] && ENCRYPTION="Unknown"
+            fi
+
+            OUT="${OUT}<br><br><b>${iface}</b><br>"
+            OUT="${OUT}SSID: <code>${SSID}</code> (${MODE})<br>"
+            OUT="${OUT}Crypt: ${ENCRYPTION}<br>"
+            if [ -n "$KEY" ]; then OUT="${OUT}Key: <code>${KEY}</code><br>"; fi
+            OUT="${OUT}Channel: ${CHAN}<br>"
+            OUT="${OUT}Rate: ${RATE}"
+
+        else
+            CHIP=$(printf '%s' "$INFO" | awk '/Hardware:/ {if (match($0, /\[.*\]/)) print substr($0, RSTART+1, RLENGTH-2); else {sub(/.*Hardware: /, ""); print}}')
+            BSSID=$(printf '%s' "$INFO" | awk '/Access Point:/ {print $3}')
+            COUNTRY=$(printf '%s' "$INFO" | awk 'match($0, /Country: [A-Z]+/) {print substr($0, RSTART+9, RLENGTH-9)}')
+            [ -z "$COUNTRY" ] && COUNTRY="World"
+
+            SIGNAL=$(printf '%s' "$INFO" | awk '/Signal:/ {split($0, a, "Signal: "); split(a[2], b, "  Noise"); s=b[1]} /Link Quality:/ {split($0, c, ": "); q=c[2]} END {print (s!="" ? s : q)}')
+            NOISE=$(printf '%s' "$INFO" | awk -F'Noise: ' '{print $2}')
+            case "$NOISE" in *unknown*) NOISE="0 dBm" ;; esac
+
+            TX_STR=$(printf '%s' "$INFO" | awk '/Tx-Power:/ {split($0,a,"Tx-Power: "); split(a[2],b,"  Link"); print b[1]}')
+            TX_VAL=$(printf '%s' "$TX_STR" | tr -cd '0-9')
+
+            if [ -n "$TX_VAL" ]; then
+                MW=$(awk "BEGIN {printf \"%.0f\", 10^($TX_VAL/10)}")
+                TX_PWR="${TX_VAL} dBm (${MW} mW)"
+            else
+                TX_PWR="$TX_STR"
+            fi
+
+            RATE=$(printf '%s' "$INFO" | awk -F'Bit Rate: ' '{print $2}')
+            HT_MODE=$(printf '%s' "$INFO" | awk -F'HT Mode: ' '/HT Mode:/ {print $2}')
+            CHAN_NUM=$(printf '%s' "$INFO" | awk -F'Channel: ' '/Channel:/ {print int($2)}')
+            CHAN_STR=$(printf '%s' "$INFO" | awk -F'Channel: ' '/Channel:/ {split($2,a,"  HT"); print a[1]}')
+
+            ICON="📡 2.4G"
+            STANDARD="802.11?"
+
+            if [ "$CHAN_NUM" -gt 14 ] 2>/dev/null; then
+                ICON="🚀 5G"
+                case "$HT_MODE" in
+                    *VHT*) STANDARD="802.11 ac/n/a" ;;
+                    *HE*)  STANDARD="802.11 ax/ac" ;;
+                    *HT*)  STANDARD="802.11 n/a" ;;
+                    *)     STANDARD="802.11 a" ;;
+                esac
+            else
+                ICON="📡 2.4G"
+                case "$HT_MODE" in
+                    *HE*) STANDARD="802.11 ax/n/g" ;;
+                    *HT*) STANDARD="802.11 b/g/n" ;;
+                    *)    STANDARD="802.11 b/g" ;;
+                esac
+            fi
+
+            WIDTH=$(printf '%s' "$HT_MODE" | sed 's/[A-Z]*//g')
+            [ -n "$WIDTH" ] && WIDTH="${WIDTH} MHz" || WIDTH="Legacy"
+
+            CLIENT_COUNT=$(iwinfo "$iface" assoclist | grep -c "dBm")
+
+            KEY="-"
+            OCV="-"
+            ENC_LIVE=$(printf '%s' "$INFO" | awk -F'Encryption: ' '/Encryption:/ {print $2}')
+
+            SECTION=$(printf '%s\n' "$UCI_WIRELESS" | awk -F. -v pat=".ssid='$SSID'" 'index($0, pat) {print $1"."$2; exit}')
+
+            if [ -n "$SECTION" ]; then
+                KEY=$(uci -q get "${SECTION}.key")
+                OCV=$(uci -q get "${SECTION}.ocv")
+                [ -z "$OCV" ] && OCV="0"
+
+                if [ "$COUNTRY" = "World" ]; then
+                    WIFI_DEV=$(uci -q get "${SECTION}.device")
+                    [ -n "$WIFI_DEV" ] && COUNTRY_UCI=$(uci -q get "wireless.${WIFI_DEV}.country")
+                    [ -n "$COUNTRY_UCI" ] && COUNTRY="${COUNTRY_UCI}"
+                fi
+            fi
+
+            OUT="${OUT}<br><br><b>${ICON} ${iface}</b><br>"
+            OUT="${OUT}<i>${CHIP}</i><br>"
+            OUT="${OUT}SSID: <code>${SSID}</code><br>"
+            OUT="${OUT}BSSID: ${BSSID} | Country: ${COUNTRY}<br>"
+            OUT="${OUT}Mode: ${STANDARD} (${WIDTH})<br>"
+            OUT="${OUT}Crypt: ${ENC_LIVE}<br>"
+
+            if [ -n "$KEY" ]; then
+                OUT="${OUT}Key: <code>${KEY}</code><br>"
+            fi
+
+            OUT="${OUT}Clients: <b>${CLIENT_COUNT}</b> | OCV: ${OCV}<br>"
+            OUT="${OUT}Channel: ${CHAN_STR}<br>"
+            OUT="${OUT}Tx: ${TX_PWR} | Rate: ${RATE}<br>"
+            OUT="${OUT}Signal: ${SIGNAL} | Noise: ${NOISE}"
+        fi
+    done
+
+    printf '%s\n' "$OUT"
+}
+
+# ==========================================
+# CLIENT DISPLAY FUNCTIONS
+# ==========================================
+
+# Resolves MAC address to hostname via DHCP leases or UCI static config.
+get_hostname() {
+    local MAC="$1"
+    local DHCP_DATA="$2"
+    local STATIC_CACHE="$3"
+
+    MAC=$(printf '%s' "$MAC" | tr -cd '0123456789abcdefABCDEF:')
+    [ -z "$MAC" ] && { printf 'Unknown\n'; return; }
+
+    local NAME
+    NAME=$(printf '%s' "$DHCP_DATA" | awk -v m="$MAC" 'tolower($0)~tolower(m) {name=$4} END {print name}')
+
+    if [ -z "$NAME" ] || [ "$NAME" = "*" ] || [ "$NAME" = "Unknown" ]; then
+        if [ -n "$STATIC_CACHE" ]; then
+            NAME=$(printf '%s' "$STATIC_CACHE" | awk -v m="$MAC" -v RS=" " 'tolower($0)~tolower(m) {split($0,a,"="); print a[2]}')
+        else
+            local SECTION
+            SECTION=$(uci show dhcp | awk -F. -v m="$MAC" -v q="'" 'BEGIN {pat="mac=" q tolower(m)} index(tolower($0), pat) {print $1"."$2; exit}')
+            [ -n "$SECTION" ] && NAME=$(uci -q get "${SECTION}.name")
+        fi
+    fi
+
+    [ -z "$NAME" ] && NAME="Unknown"
+    [ "$NAME" = "*" ] && NAME="Unknown"
+
+    printf '%s\n' "$NAME"
+}
+
+# Loads static DHCP leases from UCI into a "mac=name ..." string.
+# Pre-loading avoids calling uci inside per-client loops (slow I/O on OpenWrt flash).
+get_static_leases() {
+    uci show dhcp 2>/dev/null | awk -F. \
+        '/host.*mac/ { split($2,a,"="); mac=tolower(a[2]); gsub(/'"'"'/,"",mac) }
+         /host.*name/ { split($2,a,"="); name=a[2]; gsub(/'"'"'/,"",name); if(mac) print mac "=" name }' \
+        | tr '\n' ' '
+}
+
+get_wifi_clients() {
+    printf '🤖 <b>WiFi (LAN) Clients:</b>\n'
+
+    DHCP_DATA=$(cat /tmp/dhcp.leases 2>/dev/null)
+    ARP_DATA=$(cat /proc/net/arp 2>/dev/null)
+    DEVICES=$(get_wifi_devices)
+    IPV6_NEIGH=$(ip -6 neigh show 2>/dev/null)
+    STATIC_LEASES=$(get_static_leases)
+
+    if [ -z "$DEVICES" ]; then
+        printf 'No wireless interfaces found.\n'
+        return
+    fi
+
+    for iface in $DEVICES; do
+        INFO=$(iwinfo "$iface" info)
+
+        SSID=$(printf '%s' "$INFO" | awk -F'"' '/ESSID:/ {print $2}')
+        [ -z "$SSID" ] && SSID="Hidden"
+
+        CHAN=$(printf '%s' "$INFO" | awk -F'Channel: ' '/Channel:/ {print int($2)}')
+        if [ "$CHAN" -gt 14 ] 2>/dev/null; then ICON="🚀 5G"; else ICON="📡 2.4G"; fi
+
+        ASSOC_LIST=$(iwinfo "$iface" assoclist)
+        COUNT=$(printf '%s' "$ASSOC_LIST" | grep -c "dBm")
+
+        printf '<br><br><b>%s %s</b> [%s] (%s)<br>\n' "$ICON" "$SSID" "$iface" "$COUNT"
+
+        if [ "$COUNT" -eq 0 ]; then
+            printf '<br><i>No clients.</i>\n'
+            continue
+        fi
+
+        printf '%s\n' "$ASSOC_LIST" | while read -r line; do
+            case "$line" in *dBm*) ;; *) continue ;; esac
+
+            set -- $line
+            MAC="$1"
+            SIGNAL="$2 $3"
+
+            IP=$(printf '%s\n' "$DHCP_DATA" | awk -v m="$MAC" 'tolower($0)~tolower(m) {ip=$3} END {print ip}')
+            if [ -z "$IP" ]; then
+                IP=$(printf '%s\n' "$ARP_DATA" | awk -v m="$MAC" '$0~m {print $1; exit}')
+                [ -z "$IP" ] && IP="Unknown"
+            fi
+
+            NAME=$(printf '%s' "$DHCP_DATA" | awk -v m="$MAC" 'tolower($0)~tolower(m) {name=$4} END {print name}')
+
+            if [ -z "$NAME" ] || [ "$NAME" = "*" ] || [ "$NAME" = "Unknown" ]; then
+                NAME=$(printf '%s' "$STATIC_LEASES" | awk -v m="$MAC" -v RS=" " 'tolower($0)~tolower(m) {split($0,a,"="); print a[2]}')
+            fi
+            [ -z "$NAME" ] && NAME="Unknown"
+
+            IPV6=$(printf '%s\n' "$IPV6_NEIGH" | awk -v m="$MAC" 'tolower($0)~tolower(m) {if ($1!~/^fe80/) {print $1; f=1; exit} else {ll=$1}} END {if (!f && ll) print ll}')
+
+            printf '<br>🛜 <b>%s</b>\n' "$NAME"
+            printf '<br>IPv4: <code>%s</code> | %s\n' "$IP" "$SIGNAL"
+            if [ -n "$IPV6" ]; then printf '<br>IPv6: <small><code>%s</code></small>\n' "$IPV6"; fi
+            printf '<br>Mac: <small>%s</small>\n' "$MAC"
+        done
+    done
+}
+
+# Identifies wired clients by filtering ARP table against wireless MACs.
+get_wired_clients() {
+    printf '🤖 <b>Wired (LAN) Clients:</b>\n'
+
+    LAN_IFACE=$(uci -q get network.lan.device)
+    [ -z "$LAN_IFACE" ] && LAN_IFACE="br-lan"
+
+    WIFI_MACS=""
+    WIFI_DEVICES=$(get_wifi_devices)
+
+    for dev in $WIFI_DEVICES; do
+        MACS=$(iwinfo "$dev" assoclist | awk '{print tolower($1)}' | tr '\n' ' ')
+        WIFI_MACS="${WIFI_MACS}${MACS}"
+    done
+    WIFI_MACS=" ${WIFI_MACS} "
+
+    DHCP_DATA=$(cat /tmp/dhcp.leases 2>/dev/null)
+    STATIC_LEASES=$(get_static_leases)
+    IPV6_NEIGH=$(ip -6 neigh show 2>/dev/null)
+
+    # Single awk pass over /proc/net/arp:
+    # - Skip header (NR>1)
+    # - Match only the LAN bridge interface ($6==dev)
+    # - Exclude null entries and incomplete ARP state
+    # - Exclude MACs already seen on wireless (index in space-padded list)
+    VALID_ARP=$(awk -v dev="$LAN_IFACE" -v wifi="$WIFI_MACS" \
+        'NR>1 && $6==dev && $4!="00:00:00:00:00:00" && $3!="0x0" && index(wifi, " "tolower($4)" ")==0 {print $1, $4}' /proc/net/arp)
+
+    if [ -z "$VALID_ARP" ]; then
+        printf '<br><br><i>No active wired clients found.</i>\n'
+        return
+    fi
+
+    printf '%s\n' "$VALID_ARP" | while read -r IP MAC; do
+        NAME=$(get_hostname "$MAC" "$DHCP_DATA" "$STATIC_LEASES")
+        IPV6=$(printf '%s\n' "$IPV6_NEIGH" | awk -v m="$MAC" 'tolower($0)~tolower(m) {if ($1!~/^fe80/) {print $1; f=1; exit} else {ll=$1}} END {if (!f && ll) print ll}')
+
+        printf '<br><br>🌐 <b>%s</b>\n' "$NAME"
+        printf '<br>IPv4: <code>%s</code>\n' "$IP"
+        if [ -n "$IPV6" ]; then printf '<br>IPv6: <small><code>%s</code></small>\n' "$IPV6"; fi
+        printf '<br>Mac: <small>%s</small>\n' "$MAC"
+    done
+}
+
+# === HELPER FUNCTIONS ===
+get_iface_list() {
+    uci show network | awk -F. '/=interface$/ && !/loopback/ {split($2,a,"="); print a[1]}' | sort | awk 'NR>1{printf ", "} {printf $0}'
+}
+
+get_services_list() {
+    local list=""
+    local targets="${SVC_WANTED:-$DEFAULT_SERVICES}"
+
+    for s in $targets; do
+        [ -x "/etc/init.d/$s" ] && list="${list}$s, "
+    done
+    printf '%s' "${list%, }"
+}
+
+# === JSON PARSER WRAPPER ===
+# $1=file $2=jq expression $3=jsonfilter expression
+extract_json() {
+    if command -v jq >/dev/null 2>&1; then
+        jq -r "$2" "$1" 2>/dev/null
+    else
+        jsonfilter -i "$1" -e "$3" 2>/dev/null
+    fi
+}
+
+# === INITIALIZATION ===
+# Queries the Matrix state API to determine which configured rooms have encryption enabled.
+# Populates the global ENCRYPTED_CACHE variable (space-padded room ID list).
+init_encryption_cache() {
+    local raw_targets="$MATRIX_ROOM_ID $MATRIX_ROOM_E2EE_ID $MATRIX_ROOM_ADMIN"
+    local targets
+    targets=$(printf '%s' "$raw_targets" | awk '{for(i=1;i<=NF;i++) {gsub(/[\r"]/, "", $i); if(!seen[$i]++ && $i!="") printf "%s ", $i}}')
+
+    printf 'Initializing: Checking room encryption status via API...\n'
+    debug_log "Targets for check: $targets"
+
+    ENCRYPTED_CACHE=""
+
+    # BusyBox mktemp behaviour is inconsistent across OpenWrt versions (some ignore /tmp/ prefix,
+    # some create in CWD). Use deterministic paths based on PID to avoid any mktemp ambiguity.
+    local tmp_file="/tmp/enc_check_$$.tmp"
+    local hdr_file="/tmp/mhdr_enc_$$.tmp"
+    # Create files and immediately restrict permissions before writing any sensitive data.
+    ( umask 177 && : > "$tmp_file" && : > "$hdr_file" ) || {
+        printf 'Failed to create temp files in /tmp\n' >&2; exit 1
+    }
+
+    # Write the Bearer token to a private temp file to keep it out of ps output.
+    printf 'header = "Authorization: Bearer %s"\n' "$MATRIX_ACCESS_TOKEN" > "$hdr_file"
+
+    for room in $targets; do
+        room=$(sanitize_room_id "$room")
+        [ -z "$room" ] && continue
+
+        local enc_room
+        enc_room=$(urlencode_room "$room")
+
+        curl -s -m 5 -K "$hdr_file" \
+            -o "$tmp_file" \
+            "$MATRIX_URL/_matrix/client/v3/rooms/$enc_room/state/m.room.encryption"
+
+        local algo
+        algo=$(extract_json "$tmp_file" '.algorithm // empty' '@.algorithm')
+
+        if [ "$algo" = "m.megolm.v1.aes-sha2" ]; then
+            ENCRYPTED_CACHE="$ENCRYPTED_CACHE $room "
+            debug_log "Room State [$room]: 🔒 ENCRYPTED"
+        else
+            debug_log "Room State [$room]: 🔓 PLAINTEXT"
+        fi
+    done
+
+    rm -f "$tmp_file" "$hdr_file"
+}
+
+# === CORE EVENT HANDLER ===
+# $1=room_id  $2=sender  $3=message body
+# Central router: validates room whitelist, checks encryption context, enforces ACL.
+core_handle_event() {
+    local room_id="$1"
+    local sender="$2"
+    local body="$3"
+
+    # Only process events from rooms explicitly listed in config
+    case " $MATRIX_ROOM_ID $MATRIX_ROOM_E2EE_ID " in
+        *" $room_id "*) ;;
+        *) return ;;
+    esac
+
+    local is_room_encrypted=0
+    case " $ENCRYPTED_CACHE " in
+        *" $room_id "*) is_room_encrypted=1 ;;
+    esac
+
+    case "$sender" in
+        "$MATRIX_BOT_USER")
+            # Ignore own messages to prevent feedback loops
+            ;;
+
+        "$MATRIX_ADMIN_USER")
+            case "$RUN_MODE:$is_room_encrypted" in
+                "http:1")
+                    if [ -z "$body" ]; then
+                        debug_log "Encrypted message from Admin in HTTP mode. Room: $room_id"
+                        reply "⛔ In HTTP/NO-E2EE mode, I cannot process messages in this encrypted room." "$room_id"
+                        return
+                    fi
+                    ;;
+                "e2ee:0")
+                    if [ -n "$body" ]; then
+                        debug_log "PLAINTEXT from Admin in E2EE mode. Room: $room_id"
+                        reply "⚠️ <b>Warning:</b> The bot is in strict E2EE mode. Please enable encryption for this room." "$room_id"
+                    fi
+                    ;;
+            esac
+
+            if [ -n "$body" ]; then
+                process_command "$sender" "$body" "$room_id"
+            fi
+            ;;
+
+        *)
+            debug_log "SECURITY ALERT: Unauthorized access from $sender to $room_id"
+
+            local alert_dst="${MATRIX_ROOM_ADMIN:-${MATRIX_ROOM_E2EE_ID:-$MATRIX_ROOM_ID}}"
+
+            local display_payload="${body:-[Empty/Unknown]}"
+            if [ -z "$body" ] && [ "$RUN_MODE" = "http" ] && [ "$is_room_encrypted" -eq 1 ]; then
+                display_payload="[Encrypted Message - Content Hidden]"
+            fi
+
+            if [ -n "$alert_dst" ]; then
+                reply "⚠️ <b>SECURITY WARNING!</b><br><br><b>Unauthorized user:</b> $sender<br><b>Room:</b> <a href=\"https://matrix.to/#/$room_id\">room</a><br><b>Attempted Payload:</b> <code>$display_payload</code>" "$alert_dst"
+            fi
+            ;;
+    esac
+}
+
+# === COMMAND PROCESSOR ===
+# Parses message body into command + arguments, validates, and dispatches.
+process_command() {
+    local SENDER="$1"
+    local BODY="$2"
+    local ROOM_ID="$3"
+
+    debug_log "CMD: $BODY | Room: $ROOM_ID"
+
+    if [ -n "$MATRIX_ADMIN_USER" ] && [ "$SENDER" != "$MATRIX_ADMIN_USER" ]; then
+        reply "⚠️ Access Denied" "$ROOM_ID"
+        return
+    fi
+
+    set -f
+    set -- $BODY
+    set +f
+    CMD="$1"
+    shift
+    ARGS="$*"
+
+    # Strict allowlist for arguments: blocks all shell metacharacters.
+    SAFE_ARGS=$(printf '%s' "$ARGS" | tr -cd 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .:_-')
+
+    RES=""
+    case "$CMD" in
+        "help"|"start")
+            NGINX_INFO=""
+            if [ -x "/etc/init.d/nginx" ]; then
+                NGINX_INFO="Check config & reload nginx<br>Usage: reload nginx<br>"
+            fi
+
+            WOL_PC_INFO=""
+            if [ -n "$MAC_PC" ]; then
+                WOL_PC_INFO="2. Wake PC<br>Usage: wol_pc<br>"
+            fi
+
+            RES="🤖 <b>HELP</b><br>
+<br>
+<b>INFO:</b><br>
+1. Router uptime<br>
+Usage: uptime<br>
+2. RAM (MB)<br>
+Usage: memory<br>
+3. Memory Detail (MB)<br>
+Usage: meminfo<br>
+4. IPv4 (WAN)<br>
+Usage: wan_ip<br>
+5. DHCP clients<br>
+Usage: clients / wifi_clients / wired_clients<br>
+<br>
+<b>SERVICES:</b><br>
+Available: $(get_services_list)<br>
+Usage: restart [service]<br>
+${NGINX_INFO}
+<br>
+<b>INTERFACES:</b><br>
+Available: $(get_iface_list)<br>
+Usage: ifup [interface]<br>
+Usage: ifdown [interface]<br>
+<br>
+<b>WIFI:</b><br>
+Usage: wifi_info / wifi_up_2_4 / wifi_down_2_4 / wifi_reload_2_4<br>
+wifi_up_5 / wifi_down_5 / wifi_reload_5<br>
+<br>
+<b>WOL:</b><br>
+1. Wake-on-LAN<br>
+Usage: wol [mac]<br>
+${WOL_PC_INFO}"
+            ;;
+
+        "uptime")
+            SED_SCRIPT='s/^[ \t]*//; s/^/time: /; s/ up /<br>up: /; s/,*[ \t]*load average: /<br>load average: /'
+            UP_DATA=$(uptime | sed -E "$SED_SCRIPT")
+            RES="🤖 <b>Uptime:</b><br>$UP_DATA"
+            ;;
+
+        "memory")
+            RES="🤖 <b>Memory:</b><br>$(free | awk '/Mem:/ {printf "Total: %.0f MB Used: %.0f MB Free: %.0f MB", $2/1024, $3/1024, $4/1024}')"
+            ;;
+
+        "meminfo")
+            MEM_DATA=$(awk '$3=="kB"{$2=int($2/1024);$3="MB"} NR<=5{print $0 "<br>"}' /proc/meminfo)
+            RES="🤖 <b>Memory Detail:</b><br>$MEM_DATA"
+            ;;
+
+        "wan_ip")
+            # Determine WAN interface for --interface binding; fall back to default routing
+            IFACE=$(uci -q get network.wan.device)
+            [ -z "$IFACE" ] && IFACE=$(uci -q get network.wan.ifname)
+
+            IP=""
+            for _url in "4.ipquail.com/ip" "ifconfig.me/ip" "api64.ipify.org"; do
+                if [ -n "$IFACE" ]; then
+                    IP=$(curl -4 -s --interface "$IFACE" --connect-timeout 5 --max-time 10 "https://$_url" 2>/dev/null)
+                else
+                    IP=$(curl -4 -s --connect-timeout 5 --max-time 10 "https://$_url" 2>/dev/null)
+                fi
+                case "$IP" in
+                    *[0-9].*[0-9].*[0-9].*[0-9]*) break ;;
+                    *) IP="" ;;
+                esac
+            done
+
+            # Last resort: local WAN IP from ifstatus — no external call, but won't show
+            # the real public IP behind a double-NAT/CGNAT upstream.
+            if [ -z "$IP" ]; then
+                local ifstatus_tmp="/tmp/ifstatus_$$.tmp"
+                ( umask 177 && : > "$ifstatus_tmp" )
+                ifstatus wan 2>/dev/null > "$ifstatus_tmp"
+                IP=$(extract_json "$ifstatus_tmp" '.["ipv4-address"][0].address // empty' '@["ipv4-address"][0].address')
+                rm -f "$ifstatus_tmp"
+            fi
+
+            if [ -n "$IP" ]; then
+                RES="🤖 <b>WAN IP:</b> <code>$IP</code>"
+            else
+                RES="❌ <b>WAN IP:</b> Could not determine (all sources failed)"
+            fi
+            ;;
+
+        "wifi_clients")
+            RES=$(get_wifi_clients)
+            ;;
+
+        "wired_clients")
+            RES=$(get_wired_clients)
+            ;;
+
+        "clients")
+            RES="<b>=== NETWORK REPORT ===</b><br><br>"
+            RES="${RES}$(get_wifi_clients)<br><br>$(get_wired_clients)"
+            ;;
+
+        "restart")
+            if [ -n "$SAFE_ARGS" ]; then
+                SVC_NAME="$SAFE_ARGS"
+
+                case "$SVC_NAME" in
+                    *[!a-zA-Z0-9_-]*)
+                        RES="⛔ <b>Error:</b> Invalid service name format (only A-Z, 0-9, - and _ allowed).<br>Available: $(get_services_list)"
+                        reply "$RES" "$ROOM_ID"
+                        return
+                        ;;
+                esac
+
+                if [ -x "/etc/init.d/$SVC_NAME" ]; then
+                    local targets="${SVC_WANTED:-$DEFAULT_SERVICES}"
+
+                    case " $targets " in *" $SVC_NAME "*)
+                        RES="🤖⏳ Service $SVC_NAME restarting..."
+                        background_exec "$SVC_NAME restart" "$ROOM_ID" /etc/init.d/"$SVC_NAME" restart
+                        ;;
+                    *)
+                        RES="⛔ <b>Access Denied:</b><br>Service '$SVC_NAME' is not in the allowed list: $(get_services_list)"
+                        ;;
+                    esac
+                else
+                    RES="❌ <b>Error:</b> Service '$SVC_NAME' not found.<br>Available: $(get_services_list)"
+                fi
+            else
+                RES="🤖 Usage: restart [service]<br>Available: $(get_services_list)"
+            fi
+            ;;
+
+        "reload")
+            if [ "$SAFE_ARGS" = "nginx" ]; then
+                if [ -x "/usr/sbin/nginx" ]; then
+                    if /usr/sbin/nginx -t >/dev/null 2>&1; then
+                        RES="🤖⏳ Config OK. Nginx reloading..."
+                        background_exec "Nginx Reload" "$ROOM_ID" /usr/sbin/nginx -s reload
+                    else
+                        RES="❌ <b>Nginx Error:</b> Config check failed! Run 'nginx -t' in terminal to see details."
+                    fi
+                else
+                    RES="🤖 Error: Nginx binary not found."
+                fi
+            else
+                RES="🤖 Usage: reload nginx"
+            fi
+            ;;
+
+        "ifup")
+            if [ -n "$SAFE_ARGS" ]; then
+                if [ "$(uci -q get "network.$SAFE_ARGS")" != "interface" ]; then
+                    RES="⛔ <b>Error:</b> Interface '$SAFE_ARGS' not found in config."
+                    reply "$RES" "$ROOM_ID"
+                    return
+                fi
+                RES="🤖⏳ Interface $SAFE_ARGS starting..."
+                background_exec "Ifup $SAFE_ARGS" "$ROOM_ID" ifup "$SAFE_ARGS"
+            else
+                RES="🤖 Usage: ifup interface_name<br>Available: $(get_iface_list)"
+            fi
+            ;;
+
+        "ifdown")
+            if [ -n "$SAFE_ARGS" ]; then
+                if [ "$(uci -q get "network.$SAFE_ARGS")" != "interface" ]; then
+                    RES="⛔ <b>Error:</b> Interface '$SAFE_ARGS' not found in config."
+                    reply "$RES" "$ROOM_ID"
+                    return
+                fi
+                RES="🤖⏳ Interface $SAFE_ARGS stopping..."
+                background_exec "Ifdown $SAFE_ARGS" "$ROOM_ID" ifdown "$SAFE_ARGS"
+            else
+                RES="🤖 Usage: ifdown interface_name<br>Available: $(get_iface_list)"
+            fi
+            ;;
+
+        "wifi_info"|"wifi")
+            RES=$(get_wifi_info)
+            ;;
+
+        "wifi_down_2_4")   wifi_radio_action down   radio0 "2.4G" "$ROOM_ID" ;;
+        "wifi_up_2_4")     wifi_radio_action up     radio0 "2.4G" "$ROOM_ID" ;;
+        "wifi_reload_2_4") wifi_radio_action reload radio0 "2.4G" "$ROOM_ID" ;;
+        "wifi_down_5")     wifi_radio_action down   radio1 "5G"   "$ROOM_ID" ;;
+        "wifi_up_5")       wifi_radio_action up     radio1 "5G"   "$ROOM_ID" ;;
+        "wifi_reload_5")   wifi_radio_action reload radio1 "5G"   "$ROOM_ID" ;;
+
+        "wol")
+            if [ -n "$SAFE_ARGS" ]; then
+                if ! awk -v m="$SAFE_ARGS" 'BEGIN { exit !(m ~ /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/) }'; then
+                    RES="⛔ <b>Error:</b> Invalid MAC address format. Expected: AA:BB:CC:DD:EE:FF"
+                    reply "$RES" "$ROOM_ID"
+                    return
+                fi
+
+                if command -v etherwake >/dev/null; then
+                    IFACE=$(uci -q get network.lan.device); [ -z "$IFACE" ] && IFACE="br-lan"
+                    OUT=$(etherwake -i "$IFACE" "$SAFE_ARGS" 2>&1)
+                    if [ $? -eq 0 ]; then
+                        RES="🤖 Magic packet sent to <code>$SAFE_ARGS</code>"
+                    else
+                        RES="❌ <b>Error:</b> Failed to send WOL.<br>Output: $OUT"
+                    fi
+                else
+                    RES="❌ <b>Error:</b> <code>etherwake</code> is not installed.<br>Run: <code>opkg update && opkg install etherwake</code>"
+                fi
+            else
+                RES="🤖 Usage: wol AA:BB:CC:DD:EE:FF<br>You can see available MAC addresses using the command: <code>clients</code>"
+            fi
+            ;;
+
+        "wol_pc")
+            if [ -n "$MAC_PC" ]; then
+                if ! awk -v m="$MAC_PC" 'BEGIN { exit !(m ~ /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/) }'; then
+                    RES="❌ <b>Error:</b> Invalid MAC_PC format in config."
+                elif command -v etherwake >/dev/null; then
+                    IFACE=$(uci -q get network.lan.device); [ -z "$IFACE" ] && IFACE="br-lan"
+                    OUT=$(etherwake -i "$IFACE" "$MAC_PC" 2>&1)
+                    if [ $? -eq 0 ]; then
+                        RES="🤖 Waking PC (<code>$MAC_PC</code>)..."
+                    else
+                        RES="❌ <b>Error:</b> Failed to send WOL.<br>Output: $OUT"
+                    fi
+                else
+                    RES="❌ <b>Error:</b> <code>etherwake</code> is not installed.<br>Run: <code>opkg update && opkg install etherwake</code>"
+                fi
+            else
+                RES="🤖 Error: MAC_PC variable is not set in bot.conf"
+            fi
+            ;;
+
+        *)
+            RES="🤖 Unknown: <code>$CMD</code>.<br>Try <code>help</code>"
+            ;;
+    esac
+
+    [ -n "$RES" ] && reply "$RES" "$ROOM_ID"
+}
+
+# === LISTENERS ===
+
+# === E2EE LISTENER ===
+listen_e2ee() {
+    printf 'Starting SSH Listener...\n'
+    MC_CMD="matrix-commander-rs --listen forever --output json"
+    [ "$DEBUG_MODE" -eq 1 ] && MC_CMD="$MC_CMD --log-level error"
+    START_TIME=$(date +%s)
+    local CR
+    CR=$(printf '\r')
+
+    while true; do
+        ssh -i "$SSH_KEY" -p "$SSH_PORT" \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=/etc/matrix_bot_known_hosts \
+            -o ConnectTimeout=15 \
+            -o BatchMode=yes \
+            -tt "$SSH_USER@$SSH_HOST" "$MC_CMD" < /dev/null 2>&1 | \
+        while IFS= read -r line; do
+            line="${line%$CR}"
+
+            case "$line" in
+                \{*)
+                    case "$line" in
+                        *\"room_id\"*|*\"sender\"*) ;;
+                        *) continue ;;
+                    esac
+                    ;;
+                *) debug_log "RUST LOG: $line"; continue ;;
+            esac
+
+            debug_log "RAW SSH JSON: $line"
+
+            local tmp_line="/tmp/ssh_evt_$$.tmp"
+            ( umask 177 && : > "$tmp_line" ) || continue
+            printf '%s\n' "$line" > "$tmp_line"
+
+            TS=$(extract_json "$tmp_line" '.origin_server_ts // empty' '@.origin_server_ts')
+            SEC=${TS%???}
+
+            if [ -n "$SEC" ] && [ "$SEC" -lt "$START_TIME" ]; then
+                rm -f "$tmp_line"
+                continue
+            fi
+
+            ROOM_ID=$(extract_json "$tmp_line" '.room_id // empty' '@.room_id')
+            ROOM_ID=$(sanitize_room_id "$ROOM_ID")
+            [ -z "$ROOM_ID" ] && { rm -f "$tmp_line"; continue; }
+
+            SENDER=$(extract_json "$tmp_line" '.sender // empty' '@.sender')
+            SENDER=$(sanitize_user_id "$SENDER")
+            [ -z "$SENDER" ] && { rm -f "$tmp_line"; continue; }
+
+            BODY=$(extract_json "$tmp_line" '.body // empty' '@.body')
+
+            debug_log "Parsed - ROOM: $ROOM_ID | SENDER: $SENDER | BODY: $BODY"
+            rm -f "$tmp_line"
+
+            core_handle_event "$ROOM_ID" "$SENDER" "$BODY"
+        done
+
+        sleep 5
+    done
+}
+
+# === HTTP LISTENER (NO-E2EE / FALLBACK) ===
+listen_http() {
+    printf 'Starting HTTP Listener...\n'
+    BATCH_FILE="/tmp/matrix_next_batch"
+    START_TIME=$(date +%s)
+
+    local sync_tmp="/tmp/sync_$$.tmp"
+    local evt_tmp="/tmp/evt_$$.tmp"
+    local hdr_file="/tmp/mhdr_http_$$.tmp"
+    ( umask 177 && : > "$sync_tmp" && : > "$evt_tmp" && : > "$hdr_file" ) || {
+        printf 'Failed to create temp files in /tmp\n' >&2; exit 1
+    }
+
+    # Write auth header once; reused for every curl call in this listener.
+    printf 'header = "Authorization: Bearer %s"\n' "$MATRIX_ACCESS_TOKEN" > "$hdr_file"
+
+    curl -s -m 20 -K "$hdr_file" -o "$sync_tmp" "$MATRIX_URL/_matrix/client/v3/sync?timeout=0"
+    NEXT=$(extract_json "$sync_tmp" '.next_batch // empty' '@.next_batch')
+    [ -z "$NEXT" ] && [ -f "$BATCH_FILE" ] && NEXT=$(cat "$BATCH_FILE")
+
+    while true; do
+        if [ "$RUN_MODE" = "auto" ] && [ -n "$MAIN_PID" ]; then
+            if kill -0 "$MAIN_PID" 2>/dev/null; then sleep 5; continue; fi
+        fi
+
+        [ -n "$NEXT" ] && (set -o noclobber; printf '%s\n' "$NEXT" > "$BATCH_FILE.tmp" && mv "$BATCH_FILE.tmp" "$BATCH_FILE") 2>/dev/null
+
+        # next_batch tokens may contain '=', '+', '/' — percent-encode before embedding in query string.
+        local enc_next
+        enc_next=$(printf '%s' "$NEXT" | sed 's/%/%25/g; s/+/%2B/g; s/=/%3D/g; s/&/%26/g')
+
+        # Truncate temp files before each request to prevent stale data on curl failure.
+        : > "$sync_tmp"
+        : > "$evt_tmp"
+
+        curl -s --connect-timeout 10 -m 40 -K "$hdr_file" -o "$sync_tmp" \
+            "$MATRIX_URL/_matrix/client/v3/sync?timeout=30000&since=$enc_next"
+
+        if [ ! -s "$sync_tmp" ]; then
+            sleep 5
+            continue
+        fi
+
+        NEW_NEXT=$(extract_json "$sync_tmp" '.next_batch // empty' '@.next_batch')
+        [ -n "$NEW_NEXT" ] && NEXT="$NEW_NEXT"
+
+        # Extract room IDs as keys of the .rooms.join object.
+        if command -v jq >/dev/null 2>&1; then
+            ROOM_IDS=$(jq -r '(.rooms.join // {}) | keys[]' "$sync_tmp" 2>/dev/null)
+        else
+            ROOM_IDS=$(extract_json "$sync_tmp" '.rooms.join // empty' '@.rooms.join' | \
+                awk '{ while(match($0, /"![^"]+":/)) { print substr($0, RSTART+1, RLENGTH-3); $0=substr($0, RSTART+RLENGTH) } }')
+        fi
+
+        for ROOM_ID in $ROOM_IDS; do
+            ROOM_ID=$(sanitize_room_id "$ROOM_ID")
+            [ -z "$ROOM_ID" ] && continue
+            i=0
+            while true; do
+                # Use --arg/$idx to avoid room ID or index injecting into the jq path.
+                if command -v jq >/dev/null 2>&1; then
+                    jq -r --arg rid "$ROOM_ID" --argjson idx "$i" \
+                        '.rooms.join[$rid].timeline.events[$idx] // empty' \
+                        "$sync_tmp" > "$evt_tmp" 2>/dev/null
+                else
+                    extract_json "$sync_tmp" \
+                        ".rooms.join[\"$ROOM_ID\"].timeline.events[$i] // empty" \
+                        "@.rooms.join['$ROOM_ID'].timeline.events[$i]" > "$evt_tmp"
+                fi
+                [ ! -s "$evt_tmp" ] && break
+
+                TYPE=$(extract_json "$evt_tmp" '.type // empty' '@.type')
+                TS=$(extract_json "$evt_tmp" '.origin_server_ts // empty' '@.origin_server_ts')
+                SEC=${TS%???}
+
+                if [ -n "$SEC" ] && [ "$SEC" -ge "$START_TIME" ]; then
+                    SENDER=$(extract_json "$evt_tmp" '.sender // empty' '@.sender')
+                    SENDER=$(sanitize_user_id "$SENDER")
+
+                    BODY=""
+
+                    case "$TYPE" in
+                        "m.room.message")
+                            BODY=$(extract_json "$evt_tmp" '.content.body // empty' '@.content.body')
+                            core_handle_event "$ROOM_ID" "$SENDER" "$BODY"
+                            ;;
+                        "m.room.encrypted")
+                            core_handle_event "$ROOM_ID" "$SENDER" "$BODY"
+                            ;;
+                    esac
+                fi
+                i=$((i + 1))
+            done
+        done
+    done
+
+    rm -f "$hdr_file"
+}
+
+# === LAUNCH ===
+init_encryption_cache
+
+case "$RUN_MODE" in
+    "e2ee")
+        listen_e2ee &
+        MAIN_PID=$!
+        wait $MAIN_PID
+        ;;
+    "http")
+        listen_http &
+        MAIN_PID=$!
+        wait $MAIN_PID
+        ;;
+    "auto")
+        printf 'Starting AUTO mode...\n'
+        listen_e2ee &
+        MAIN_PID=$!
+        listen_http
+        ;;
+esac
